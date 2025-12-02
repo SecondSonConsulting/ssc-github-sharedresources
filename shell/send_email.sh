@@ -90,52 +90,64 @@ function send_email() {
     jsonRecipients=$(printf '"%s",' "${emailRecipients[@]}")
     jsonRecipients="[${jsonRecipients%,}]"
 
-    # Construct JSON payload using jq (safe quoting)
-    local jsonData
-    jsonData=$(jq -n \
+    # Write initial JSON to a file (no large data in variables)
+    local jsonFile
+    jsonFile="$(mktemp /var/tmp/emailPayload.XXXXXX)"
+
+    jq -n \
         --arg api_key "$smtp2goKey" \
         --arg from_name "$emailFromName" \
         --arg from_addr "$emailFromAddress" \
         --arg subject "$emailSubject" \
         --arg text_body "$emailBody" \
         --argjson to "$jsonRecipients" \
-        '{
+        '
+        {
             api_key: $api_key,
             to: $to,
             sender: $from_addr,
             from: ($from_name + " <" + $from_addr + ">"),
             subject: $subject,
-            text_body: $text_body
-        }'
-    )
+            text_body: $text_body,
+            attachments: []
+        }
+        ' > "$jsonFile"
 
-    # Build attachments array (if any)
-    local attachmentsJson="[]"
+
+    # Append attachments directly into the JSON file
+    # WE MUST AVOID using shell vars for attachment base64 values due to maximum argument limitations
     for attachment in "${attachments[@]}"; do
-        fileBlob=$(base64 -i "$attachment")
         mimeType=$(file --mime-type -b "$attachment")
         filename=$(basename "$attachment")
 
-        attachmentsJson=$(jq --arg filename "$filename" \
-                             --arg fileblob "$fileBlob" \
-                             --arg mimetype "$mimeType" \
-                             '. += [{"filename": $filename, "fileblob": $fileblob, "mimetype": $mimetype}]' \
-                             <<< "$attachmentsJson")
+        tmp_b64=$(mktemp /var/tmp/attachmentBlob.XXXXXX)
+        base64 -i "$attachment" > "$tmp_b64"
+
+        jq --rawfile fileblob "$tmp_b64" \
+           --arg filename "$filename" \
+           --arg mimetype "$mimeType" \
+           '
+           .attachments += [{
+               filename: $filename,
+               mimetype: $mimetype,
+               fileblob: $fileblob
+           }]
+           ' "$jsonFile" > "${jsonFile}.tmp" && mv "${jsonFile}.tmp" "$jsonFile"
+
+        rm -f "$tmp_b64"
     done
 
-    if [ -n "${attachments[0]}" ]; then
-        jsonData=$(jq --argjson attachments "$attachmentsJson" \
-                  '. + {attachments: $attachments}' <<< "$jsonData")
-    fi
-    
+    # Optional debug mode
     if [[ "$dryRun" != "curl" ]]; then
         echo "******* JSON DATA ******"
-        echo "$jsonData" | jq .
+        jq . "$jsonFile"
         echo "******* END JSON DATA ******"
     fi
 
     echo "Sending email..."
     "$dryRun" --silent --location "$smtp2goSendingEndpoint" \
         --header "Content-Type: application/json" \
-        --data "$jsonData"
+        --data-binary @"$jsonFile"
+
+    [[ "$dryRun" == "curl" ]] && rm -f "$jsonFile"
 }
